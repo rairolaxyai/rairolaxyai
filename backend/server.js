@@ -4,15 +4,10 @@ const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
-
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
-
-// ==========================================
-// PROVIDER CONFIGURATION
-// ==========================================
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
@@ -24,20 +19,18 @@ const NVIDIA_MODEL =
   process.env.NVIDIA_MODEL ||
   "nvidia/nemotron-3-super-120b-a12b";
 
-const GEMINI_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/" +
-  encodeURIComponent(GEMINI_MODEL) +
-  ":generateContent";
+const GEMINI_BASE =
+  "https://generativelanguage.googleapis.com/v1beta/models";
 
 const NVIDIA_URL =
   "https://integrate.api.nvidia.com/v1/chat/completions";
 
-const GEMINI_TIMEOUT_MS = Math.min(
-  Math.max(Number(process.env.GEMINI_TIMEOUT_MS) || 45000, 1000),
+const GEMINI_TIMEOUT = Math.min(
+  Math.max(Number(process.env.GEMINI_TIMEOUT_MS) || 30000, 1000),
   120000
 );
 
-const NVIDIA_TIMEOUT_MS = Math.min(
+const NVIDIA_TIMEOUT = Math.min(
   Math.max(Number(process.env.NVIDIA_TIMEOUT_MS) || 60000, 1000),
   120000
 );
@@ -46,32 +39,77 @@ const MAX_MESSAGE_CHARS = 20000;
 const MAX_HISTORY_MESSAGES = 30;
 
 // ==========================================
-// COMMON HELPERS
+// SAFE ERROR LOGGING
 // ==========================================
 
-function logProviderError(provider, error) {
-  // Never print API keys or authorization headers.
+function logError(provider, error) {
   const message = String(error?.message || error)
     .replace(/key=[^&\s]+/gi, "key=[REDACTED]")
-    .slice(0, 500);
+    .slice(0, 400);
 
-  console.error(`[${provider}] Request failed: ${message}`);
+  console.error(`[${provider}] ${message}`);
 }
 
-function getMessageText(content) {
-  if (typeof content === "string") {
-    return content.trim();
+// ==========================================
+// HTTP JSON HELPER WITH TIMEOUT
+// ==========================================
+
+async function fetchJson(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+
+    const text = await response.text();
+    let data;
+
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(
+        `Invalid JSON response (HTTP ${response.status})`
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        `HTTP ${response.status}: ${
+          data?.error?.message || data?.message || "Request failed"
+        }`
+      );
+    }
+
+    return data;
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+// ==========================================
+// NORMALIZE CHAT MESSAGES
+// ==========================================
+
+function getText(content) {
+  if (typeof content === "string") return content.trim();
 
   if (Array.isArray(content)) {
     return content
-      .map((part) => {
-        if (typeof part === "string") return part;
-        if (part && typeof part.text === "string") {
-          return part.text;
-        }
-        return "";
-      })
+      .map(part =>
+        typeof part === "string"
+          ? part
+          : typeof part?.text === "string"
+            ? part.text
+            : ""
+      )
       .join("")
       .trim();
   }
@@ -80,113 +118,129 @@ function getMessageText(content) {
 }
 
 function normalizeMessages(body = {}) {
-  const messages = [];
-  const rawMessages = Array.isArray(body.messages)
+  const result = [];
+  const history = Array.isArray(body.messages)
     ? body.messages.slice(-MAX_HISTORY_MESSAGES)
     : [];
 
-  for (const item of rawMessages) {
+  for (const item of history) {
     if (!item || typeof item !== "object") continue;
 
-    const role =
-      item.role === "assistant"
-        ? "assistant"
-        : item.role === "user"
-          ? "user"
-          : null;
+    if (!["user", "assistant"].includes(item.role)) continue;
 
-    const content = getMessageText(item.content);
-
-    if (!role || !content) continue;
+    const content = getText(item.content);
+    if (!content) continue;
 
     if (content.length > MAX_MESSAGE_CHARS) {
-      throw new Error("A message in the conversation is too long.");
+      throw new Error("A message is too long.");
     }
 
-    messages.push({ role, content });
+    result.push({
+      role: item.role,
+      content
+    });
   }
 
-  const latestMessage =
+  const message =
     typeof body.message === "string" ? body.message.trim() : "";
 
-  if (latestMessage) {
-    if (latestMessage.length > MAX_MESSAGE_CHARS) {
+  if (message) {
+    if (message.length > MAX_MESSAGE_CHARS) {
       throw new Error("Message is too long.");
     }
 
-    const last = messages[messages.length - 1];
+    const last = result[result.length - 1];
 
-    // Avoid duplicate user messages when both fields are supplied.
     if (
       !last ||
       last.role !== "user" ||
-      last.content !== latestMessage
+      last.content !== message
     ) {
-      messages.push({
-        role: "user",
-        content: latestMessage
-      });
+      result.push({ role: "user", content: message });
     }
   }
 
-  if (messages.length === 0) {
+  if (!result.length) {
     throw new Error("Please provide a message.");
   }
 
-  if (messages[messages.length - 1].role !== "user") {
-    throw new Error("The latest message must be from the user.");
+  if (result[result.length - 1].role !== "user") {
+    throw new Error("The last message must be from the user.");
   }
 
-  return messages;
+  return result;
 }
 
-async function fetchJson(url, options, timeoutMs) {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    timeoutMs
+// ==========================================
+// DISCOVER AVAILABLE GEMINI MODELS
+// ==========================================
+
+async function discoverGeminiModels() {
+  if (!GEMINI_API_KEY) return [];
+
+  const data = await fetchJson(
+    `${GEMINI_BASE}?key=${encodeURIComponent(GEMINI_API_KEY)}`,
+    { method: "GET" },
+    Math.min(GEMINI_TIMEOUT, 15000)
   );
 
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
+  return (Array.isArray(data.models) ? data.models : [])
+    .filter(model => {
+      const name = model?.name || "";
+      const methods = model?.supportedGenerationMethods || [];
 
-    const rawText = await response.text();
-
-    let data;
-
-    try {
-      data = rawText ? JSON.parse(rawText) : {};
-    } catch {
-      throw new Error(
-        `Provider returned invalid JSON (HTTP ${response.status}).`
+      return (
+        methods.includes("generateContent") &&
+        !/embedding|aqa|image|audio|tts|veo|robotics/i.test(name)
       );
-    }
-
-    if (!response.ok) {
-      const message =
-        data?.error?.message ||
-        data?.message ||
-        `HTTP ${response.status}`;
-
-      throw new Error(
-        `HTTP ${response.status}: ${String(message).slice(0, 300)}`
-      );
-    }
-
-    return data;
-  } finally {
-    clearTimeout(timeout);
-  }
+    })
+    .map(model => String(model.name).replace(/^models\//, ""));
 }
 
 // ==========================================
-// PRIMARY AI: GOOGLE GEMINI
+// BUILD GEMINI MODEL PRIORITY
 // ==========================================
 
-async function askGemini(messages) {
+async function getGeminiCandidates() {
+  const models = [];
+
+  function add(model) {
+    if (typeof model !== "string") return;
+
+    const name = model.replace(/^models\//, "").trim();
+
+    if (name && !models.includes(name)) {
+      models.push(name);
+    }
+  }
+
+  // First attempt: explicitly configured model.
+  add(GEMINI_MODEL);
+
+  try {
+    const available = await discoverGeminiModels();
+
+    // Prefer Flash models after the configured first attempt.
+    available.sort((a, b) => {
+      const aRank = /flash/i.test(a) ? 0 : 1;
+      const bRank = /flash/i.test(b) ? 0 : 1;
+
+      return aRank - bRank || a.localeCompare(b);
+    });
+
+    available.forEach(add);
+  } catch (error) {
+    logError("Gemini model discovery", error);
+  }
+
+  return models;
+}
+
+// ==========================================
+// GEMINI REQUEST
+// ==========================================
+
+async function askGemini(messages, model) {
   if (!GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is not configured.");
   }
@@ -194,12 +248,9 @@ async function askGemini(messages) {
   const contents = [];
 
   for (const message of messages) {
-    const role =
-      message.role === "assistant" ? "model" : "user";
-
+    const role = message.role === "assistant" ? "model" : "user";
     const previous = contents[contents.length - 1];
 
-    // Gemini expects alternating user/model turns.
     if (previous && previous.role === role) {
       previous.parts[0].text += "\n\n" + message.content;
     } else {
@@ -210,7 +261,7 @@ async function askGemini(messages) {
     }
   }
 
-  // Gemini conversation history must start with a user turn.
+  // Gemini requires the conversation to begin with a user message.
   while (contents.length && contents[0].role !== "user") {
     contents.shift();
   }
@@ -219,8 +270,12 @@ async function askGemini(messages) {
     throw new Error("No valid user message for Gemini.");
   }
 
+  const url =
+    `${GEMINI_BASE}/${encodeURIComponent(model)}` +
+    `:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
   const data = await fetchJson(
-    `${GEMINI_URL}?key=${encodeURIComponent(GEMINI_API_KEY)}`,
+    url,
     {
       method: "POST",
       headers: {
@@ -234,24 +289,20 @@ async function askGemini(messages) {
         }
       })
     },
-    GEMINI_TIMEOUT_MS
+    GEMINI_TIMEOUT
   );
 
   const parts = data?.candidates?.[0]?.content?.parts || [];
 
   const answer = parts
-    .map((part) =>
-      typeof part.text === "string" ? part.text : ""
-    )
+    .map(part => typeof part.text === "string" ? part.text : "")
     .join("")
     .trim();
 
   if (!answer) {
-    const reason = data?.candidates?.[0]?.finishReason;
-
     throw new Error(
-      reason
-        ? `Gemini returned no text. Finish reason: ${reason}`
+      data?.candidates?.[0]?.finishReason
+        ? `Gemini returned no text: ${data.candidates[0].finishReason}`
         : "Gemini returned an empty answer."
     );
   }
@@ -260,7 +311,7 @@ async function askGemini(messages) {
 }
 
 // ==========================================
-// FALLBACK AI: NVIDIA
+// NVIDIA REQUEST
 // ==========================================
 
 async function askNvidia(messages) {
@@ -284,12 +335,10 @@ async function askNvidia(messages) {
         stream: false
       })
     },
-    NVIDIA_TIMEOUT_MS
+    NVIDIA_TIMEOUT
   );
 
-  const answer = getMessageText(
-    data?.choices?.[0]?.message?.content
-  );
+  const answer = getText(data?.choices?.[0]?.message?.content);
 
   if (!answer) {
     throw new Error("NVIDIA returned an empty answer.");
@@ -303,21 +352,18 @@ async function askNvidia(messages) {
 // ==========================================
 
 app.get("/health", (req, res) => {
-  const geminiConfigured = Boolean(GEMINI_API_KEY);
-  const nvidiaConfigured = Boolean(NVIDIA_API_KEY);
-
   res.json({
     success: true,
     status: "healthy",
-    aiConfigured: geminiConfigured || nvidiaConfigured,
+    aiConfigured: Boolean(GEMINI_API_KEY || NVIDIA_API_KEY),
     primaryProvider: "Gemini",
     fallbackProvider: "NVIDIA",
     providers: {
-      geminiConfigured,
-      nvidiaConfigured
+      geminiConfigured: Boolean(GEMINI_API_KEY),
+      nvidiaConfigured: Boolean(NVIDIA_API_KEY)
     },
     models: {
-      gemini: GEMINI_MODEL,
+      geminiFirstAttempt: GEMINI_MODEL,
       nvidia: NVIDIA_MODEL
     }
   });
@@ -333,11 +379,11 @@ app.get("/api/status", (req, res) => {
     aiConfigured: Boolean(GEMINI_API_KEY || NVIDIA_API_KEY),
     primaryProvider: "Gemini",
     fallbackProvider: "NVIDIA",
-    fallbackEnabled: Boolean(GEMINI_API_KEY && NVIDIA_API_KEY),
+    modelDiscoveryEnabled: true,
     providers: {
       gemini: {
         configured: Boolean(GEMINI_API_KEY),
-        model: GEMINI_MODEL
+        firstAttemptModel: GEMINI_MODEL
       },
       nvidia: {
         configured: Boolean(NVIDIA_API_KEY),
@@ -348,7 +394,8 @@ app.get("/api/status", (req, res) => {
 });
 
 // ==========================================
-// CHAT API: GEMINI FIRST, NVIDIA SECOND
+// MAIN CHAT API
+// Gemini models -> NVIDIA fallback
 // ==========================================
 
 app.post("/api/chat", async (req, res) => {
@@ -359,31 +406,46 @@ app.post("/api/chat", async (req, res) => {
   } catch (error) {
     return res.status(400).json({
       success: false,
-      error: error.message || "Invalid message."
+      error: error.message
     });
   }
 
   const failures = [];
 
-  // 1. Try Gemini first.
+  // 1. Try configured Gemini model, then discovered models.
   if (GEMINI_API_KEY) {
-    try {
-      const answer = await askGemini(messages);
+    const candidates = await getGeminiCandidates();
 
-      return res.json({
-        success: true,
-        reply: answer,
-        answer,
-        provider: "Gemini",
-        model: GEMINI_MODEL,
-        fallbackUsed: false
-      });
-    } catch (error) {
-      logProviderError("Gemini", error);
+    for (const model of candidates) {
+      try {
+        console.log(`Trying Gemini model: ${model}`);
 
+        const answer = await askGemini(messages, model);
+
+        return res.json({
+          success: true,
+          reply: answer,
+          response: answer,
+          answer,
+          provider: "Gemini",
+          model,
+          fallbackUsed: model !== GEMINI_MODEL
+        });
+      } catch (error) {
+        logError(`Gemini ${model}`, error);
+
+        failures.push({
+          provider: "Gemini",
+          model,
+          error: error.message
+        });
+      }
+    }
+
+    if (!candidates.length) {
       failures.push({
         provider: "Gemini",
-        error: error.message
+        error: "No available Gemini models were discovered."
       });
     }
   } else {
@@ -393,21 +455,24 @@ app.post("/api/chat", async (req, res) => {
     });
   }
 
-  // 2. If Gemini fails, try NVIDIA.
+  // 2. NVIDIA runs only after Gemini candidates fail.
   if (NVIDIA_API_KEY) {
     try {
+      console.log("Gemini attempts exhausted. Switching to NVIDIA.");
+
       const answer = await askNvidia(messages);
 
       return res.json({
         success: true,
         reply: answer,
+        response: answer,
         answer,
         provider: "NVIDIA",
         model: NVIDIA_MODEL,
         fallbackUsed: true
       });
     } catch (error) {
-      logProviderError("NVIDIA", error);
+      logError("NVIDIA fallback", error);
 
       failures.push({
         provider: "NVIDIA",
@@ -424,7 +489,7 @@ app.post("/api/chat", async (req, res) => {
   // Both providers failed.
   return res.status(502).json({
     success: false,
-    error: "Both AI providers failed to generate a response.",
+    error: "All configured AI providers failed.",
     details: failures
   });
 });
@@ -445,9 +510,9 @@ app.use("/api", (req, res) => {
 // ==========================================
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Rairolaxy AI backend listening on port ${PORT}`);
+  console.log(`Rairolaxy AI backend running on port ${PORT}`);
   console.log(`Gemini configured: ${Boolean(GEMINI_API_KEY)}`);
   console.log(`NVIDIA configured: ${Boolean(NVIDIA_API_KEY)}`);
-  console.log(`Primary model: ${GEMINI_MODEL}`);
-  console.log(`Fallback model: ${NVIDIA_MODEL}`);
+  console.log(`First Gemini model: ${GEMINI_MODEL}`);
+  console.log(`NVIDIA fallback model: ${NVIDIA_MODEL}`);
 });
