@@ -13,9 +13,7 @@ const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
 
-const GEMINI_MODEL =
-  process.env.GEMINI_MODEL || "gemini-2.5-flash";
-
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const NVIDIA_MODEL =
   process.env.NVIDIA_MODEL ||
   "nvidia/nemotron-3-super-120b-a12b";
@@ -41,6 +39,50 @@ const MAX_HISTORY_MESSAGES = 30;
 const MAX_IMAGE_CHARS = 11_200_000;
 
 // ==========================================
+// RAIROLAXY AI IDENTITY
+// ==========================================
+
+const SYSTEM_PROMPT = `
+You are Rairolaxy AI, the official AI assistant created by Rairolaxy.
+
+IDENTITY RULES:
+1. Your name and identity are always Rairolaxy AI.
+2. Never introduce yourself as Gemini, NVIDIA, Nemotron, or another AI provider.
+3. Gemini and NVIDIA are internal AI model providers only.
+4. If asked who you are, say:
+   "I am Rairolaxy AI, your AI assistant."
+5. Never claim that you were created by Google or NVIDIA.
+6. Respond naturally in the same language as the user.
+7. Be helpful, accurate, clear and conversational.
+8. Do not invent facts or pretend to have capabilities you do not have.
+9. Do not claim to access a camera or screen unless an image frame
+   has actually been supplied by the application.
+10. When an image is supplied, analyze only what is visible in it.
+11. Never claim to see a continuous live video stream when you
+    receive only individual image frames.
+12. Keep your application identity separate from your AI provider.
+
+You are Rairolaxy AI. Always maintain this identity.
+`;
+
+const VISION_SYSTEM_PROMPT = `
+You are Rairolaxy AI, the official AI assistant created by Rairolaxy.
+
+You are analyzing an image frame supplied by the Rairolaxy AI application.
+
+RULES:
+1. Your identity is always Rairolaxy AI.
+2. Never identify yourself as Gemini, NVIDIA or another provider.
+3. Analyze only the supplied image.
+4. Describe only things that are actually visible.
+5. Do not claim to see outside the supplied image.
+6. Do not claim continuous live video access.
+7. Answer the user's question directly.
+8. Respond in the user's language.
+9. If the image is unclear, explain that honestly.
+`;
+
+// ==========================================
 // ERROR LOGGING
 // ==========================================
 
@@ -54,7 +96,7 @@ function logError(provider, error) {
 }
 
 // ==========================================
-// HTTP JSON HELPER WITH TIMEOUT
+// HTTP JSON HELPER
 // ==========================================
 
 async function fetchJson(url, options = {}, timeoutMs = 30000) {
@@ -73,9 +115,7 @@ async function fetchJson(url, options = {}, timeoutMs = 30000) {
     try {
       data = text ? JSON.parse(text) : {};
     } catch {
-      throw new Error(
-        `Invalid JSON response (HTTP ${response.status})`
-      );
+      throw new Error(`Invalid JSON response (HTTP ${response.status})`);
     }
 
     if (!response.ok) {
@@ -101,7 +141,7 @@ async function fetchJson(url, options = {}, timeoutMs = 30000) {
 }
 
 // ==========================================
-// NORMALIZE CHAT MESSAGES
+// MESSAGE HELPERS
 // ==========================================
 
 function getText(content) {
@@ -127,15 +167,18 @@ function getText(content) {
 
 function normalizeMessages(body = {}) {
   const result = [];
+
   const history = Array.isArray(body.messages)
     ? body.messages.slice(-MAX_HISTORY_MESSAGES)
     : [];
 
   for (const item of history) {
     if (!item || typeof item !== "object") continue;
+
     if (!["user", "assistant"].includes(item.role)) continue;
 
     const content = getText(item.content);
+
     if (!content) continue;
 
     if (content.length > MAX_MESSAGE_CHARS) {
@@ -184,7 +227,7 @@ function normalizeMessages(body = {}) {
 }
 
 // ==========================================
-// DISCOVER AVAILABLE GEMINI MODELS
+// GEMINI MODEL DISCOVERY
 // ==========================================
 
 async function discoverGeminiModels() {
@@ -208,10 +251,6 @@ async function discoverGeminiModels() {
     })
     .map(model => String(model.name).replace(/^models\//, ""));
 }
-
-// ==========================================
-// GEMINI MODEL PRIORITY
-// ==========================================
 
 async function getGeminiCandidates() {
   const models = [];
@@ -293,6 +332,9 @@ async function askGemini(messages, model) {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: SYSTEM_PROMPT }]
+        },
         contents,
         generationConfig: {
           temperature: 0.7,
@@ -322,14 +364,13 @@ async function askGemini(messages, model) {
 }
 
 // ==========================================
-// GEMINI IMAGE / VISION ANALYSIS
+// GEMINI VISION
+// CAMERA + SCREEN ANALYSIS
 // ==========================================
 
 async function askGeminiVision(image, prompt, model) {
   if (!GEMINI_API_KEY) {
-    throw new Error(
-      "Camera and screen image analysis requires GEMINI_API_KEY."
-    );
+    throw new Error("Vision requires GEMINI_API_KEY.");
   }
 
   const match = image.match(
@@ -338,7 +379,7 @@ async function askGeminiVision(image, prompt, model) {
 
   if (!match) {
     throw new Error(
-      "Image must be a base64 data URL using JPEG, PNG or WEBP."
+      "Image must be a JPEG, PNG or WEBP base64 data URL."
     );
   }
 
@@ -357,6 +398,11 @@ async function askGeminiVision(image, prompt, model) {
     `${GEMINI_BASE}/${encodeURIComponent(model)}` +
     `:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
+  const userPrompt =
+    typeof prompt === "string" && prompt.trim()
+      ? prompt.trim()
+      : "Describe what is visible in this image.";
+
   const data = await fetchJson(
     url,
     {
@@ -365,16 +411,14 @@ async function askGeminiVision(image, prompt, model) {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: VISION_SYSTEM_PROMPT }]
+        },
         contents: [
           {
             role: "user",
             parts: [
-              {
-                text:
-                  prompt ||
-                  "Describe the visible image accurately. " +
-                  "Answer naturally in the user's language."
-              },
+              { text: userPrompt },
               {
                 inlineData: {
                   mimeType,
@@ -401,24 +445,28 @@ async function askGeminiVision(image, prompt, model) {
     .trim();
 
   if (!answer) {
-    throw new Error(
-      data?.candidates?.[0]?.finishReason
-        ? `Gemini returned no vision answer: ${data.candidates[0].finishReason}`
-        : "Gemini returned an empty vision answer."
-    );
+    throw new Error("Gemini returned an empty vision answer.");
   }
 
   return answer;
 }
 
 // ==========================================
-// NVIDIA TEXT CHAT FALLBACK
+// NVIDIA CHAT FALLBACK
 // ==========================================
 
 async function askNvidia(messages) {
   if (!NVIDIA_API_KEY) {
     throw new Error("NVIDIA_API_KEY is not configured.");
   }
+
+  const nvidiaMessages = [
+    {
+      role: "system",
+      content: SYSTEM_PROMPT
+    },
+    ...messages
+  ];
 
   const data = await fetchJson(
     NVIDIA_URL,
@@ -430,7 +478,7 @@ async function askNvidia(messages) {
       },
       body: JSON.stringify({
         model: NVIDIA_MODEL,
-        messages,
+        messages: nvidiaMessages,
         temperature: 0.7,
         max_tokens: 2048,
         stream: false
@@ -457,8 +505,10 @@ async function askNvidia(messages) {
 app.get("/health", (req, res) => {
   res.json({
     success: true,
+    app: "Rairolaxy AI",
     status: "healthy",
     aiConfigured: Boolean(GEMINI_API_KEY || NVIDIA_API_KEY),
+    applicationIdentity: "Rairolaxy AI",
     primaryProvider: "Gemini",
     fallbackProvider: "NVIDIA",
     providers: {
@@ -466,7 +516,7 @@ app.get("/health", (req, res) => {
       nvidiaConfigured: Boolean(NVIDIA_API_KEY)
     },
     models: {
-      geminiFirstAttempt: GEMINI_MODEL,
+      gemini: GEMINI_MODEL,
       nvidia: NVIDIA_MODEL
     }
   });
@@ -479,6 +529,8 @@ app.get("/health", (req, res) => {
 app.get("/api/status", (req, res) => {
   res.json({
     success: true,
+    app: "Rairolaxy AI",
+    applicationIdentity: "Rairolaxy AI",
     aiConfigured: Boolean(GEMINI_API_KEY || NVIDIA_API_KEY),
     primaryProvider: "Gemini",
     fallbackProvider: "NVIDIA",
@@ -505,6 +557,7 @@ app.get("/api/capabilities", (req, res) => {
   res.json({
     success: true,
     app: "Rairolaxy AI",
+    identity: "Rairolaxy AI",
     chat: {
       enabled: Boolean(GEMINI_API_KEY || NVIDIA_API_KEY),
       endpoint: "/api/chat"
@@ -530,7 +583,7 @@ app.get("/api/capabilities", (req, res) => {
 
 // ==========================================
 // MAIN CHAT API
-// Gemini models -> NVIDIA fallback
+// GEMINI PRIMARY -> NVIDIA FALLBACK
 // ==========================================
 
 app.post("/api/chat", async (req, res) => {
@@ -552,15 +605,17 @@ app.post("/api/chat", async (req, res) => {
 
     for (const model of candidates) {
       try {
-        console.log(`Trying Gemini model: ${model}`);
+        console.log(`Rairolaxy AI using Gemini model: ${model}`);
 
         const answer = await askGemini(messages, model);
 
         return res.json({
           success: true,
+          app: "Rairolaxy AI",
           reply: answer,
           response: answer,
           answer,
+          identity: "Rairolaxy AI",
           provider: "Gemini",
           model,
           fallbackUsed: model !== GEMINI_MODEL
@@ -591,15 +646,17 @@ app.post("/api/chat", async (req, res) => {
 
   if (NVIDIA_API_KEY) {
     try {
-      console.log("Gemini attempts exhausted. Switching to NVIDIA.");
+      console.log("Switching Rairolaxy AI chat to NVIDIA fallback.");
 
       const answer = await askNvidia(messages);
 
       return res.json({
         success: true,
+        app: "Rairolaxy AI",
         reply: answer,
         response: answer,
         answer,
+        identity: "Rairolaxy AI",
         provider: "NVIDIA",
         model: NVIDIA_MODEL,
         fallbackUsed: true
@@ -621,6 +678,7 @@ app.post("/api/chat", async (req, res) => {
 
   return res.status(502).json({
     success: false,
+    app: "Rairolaxy AI",
     error: "All configured AI providers failed.",
     details: failures
   });
@@ -636,14 +694,15 @@ app.post("/api/vision", async (req, res) => {
   if (!GEMINI_API_KEY) {
     return res.status(503).json({
       success: false,
-      error:
-        "Vision is not configured. Add GEMINI_API_KEY in Render environment variables."
+      error: "Vision is not configured. Add GEMINI_API_KEY."
     });
   }
 
   const body = req.body || {};
+
   const source = body.source;
   const image = body.image;
+
   const prompt =
     typeof body.prompt === "string"
       ? body.prompt.trim()
@@ -666,7 +725,7 @@ app.post("/api/vision", async (req, res) => {
   if (image.length > MAX_IMAGE_CHARS) {
     return res.status(413).json({
       success: false,
-      error: "Image is too large. Reduce the image resolution or quality."
+      error: "Image is too large. Reduce resolution or quality."
     });
   }
 
@@ -682,7 +741,9 @@ app.post("/api/vision", async (req, res) => {
 
   for (const model of candidates) {
     try {
-      console.log(`Vision request (${source}) using ${model}`);
+      console.log(
+        `Rairolaxy AI vision (${source}) using ${model}`
+      );
 
       const answer = await askGeminiVision(
         image,
@@ -692,6 +753,8 @@ app.post("/api/vision", async (req, res) => {
 
       return res.json({
         success: true,
+        app: "Rairolaxy AI",
+        identity: "Rairolaxy AI",
         answer,
         reply: answer,
         response: answer,
@@ -711,6 +774,7 @@ app.post("/api/vision", async (req, res) => {
 
   return res.status(502).json({
     success: false,
+    app: "Rairolaxy AI",
     error: "Image analysis failed for all available Gemini models.",
     details: failures
   });
@@ -763,7 +827,8 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Gemini configured: ${Boolean(GEMINI_API_KEY)}`);
   console.log(`NVIDIA configured: ${Boolean(NVIDIA_API_KEY)}`);
   console.log(`Vision configured: ${Boolean(GEMINI_API_KEY)}`);
-  console.log(`First Gemini model: ${GEMINI_MODEL}`);
+  console.log(`Application identity: Rairolaxy AI`);
+  console.log(`Gemini model: ${GEMINI_MODEL}`);
   console.log(`NVIDIA fallback model: ${NVIDIA_MODEL}`);
 });
-    
+        
