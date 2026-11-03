@@ -1,4 +1,3 @@
-
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
@@ -10,19 +9,26 @@ app.use(express.json({ limit: "12mb" }));
 
 const PORT = process.env.PORT || 3000;
 
+// API KEYS — Render Environment Variables se aayengi
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
+const INCEPTION_API_KEY = process.env.INCEPTION_API_KEY;
 
+// Models
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const NVIDIA_MODEL =
-  process.env.NVIDIA_MODEL ||
-  "nvidia/nemotron-3-super-120b-a12b";
+  process.env.NVIDIA_MODEL || "nvidia/nemotron-3-super-120b-a12b";
 
 const GEMINI_BASE =
   "https://generativelanguage.googleapis.com/v1beta/models";
-
 const NVIDIA_URL =
   "https://integrate.api.nvidia.com/v1/chat/completions";
+const INCEPTION_BASE = "https://api.inceptionlabs.ai/v1";
+
+const MAX_MESSAGE_CHARS = 20000;
+const MAX_HISTORY_MESSAGES = 30;
+const MAX_IMAGE_CHARS = 11200000;
+const INCEPTION_CACHE_MS = 5 * 60 * 1000;
 
 const GEMINI_TIMEOUT = Math.min(
   Math.max(Number(process.env.GEMINI_TIMEOUT_MS) || 30000, 1000),
@@ -34,52 +40,32 @@ const NVIDIA_TIMEOUT = Math.min(
   120000
 );
 
-const MAX_MESSAGE_CHARS = 20000;
-const MAX_HISTORY_MESSAGES = 30;
-const MAX_IMAGE_CHARS = 11_200_000;
-
-// ==========================================
-// RAIROLAXY AI IDENTITY
-// ==========================================
-
 const SYSTEM_PROMPT = `
 You are Rairolaxy AI, the official AI assistant created by Rairolaxy.
 
-IDENTITY RULES:
-1. Your name and identity are always Rairolaxy AI.
-2. Never introduce yourself as Gemini, NVIDIA, Nemotron, or another AI provider.
-3. Gemini and NVIDIA are internal AI model providers only.
-4. If asked who you are, say:
-   "I am Rairolaxy AI, your AI assistant."
-5. Never claim that you were created by Google or NVIDIA.
-6. Respond naturally in the same language as the user.
-7. Be helpful, accurate, clear and conversational.
-8. Do not invent facts or pretend to have capabilities you do not have.
-9. Do not claim to access a camera or screen unless an image frame
-   has actually been supplied by the application.
-10. When an image is supplied, analyze only what is visible in it.
-11. Never claim to see a continuous live video stream when you
-    receive only individual image frames.
-12. Keep your application identity separate from your AI provider.
+Your identity is always Rairolaxy AI.
+Never introduce yourself as Gemini, NVIDIA, Nemotron, Inception,
+or another AI provider. These are internal providers only.
 
-You are Rairolaxy AI. Always maintain this identity.
+If asked who you are, say:
+"I am Rairolaxy AI, your AI assistant."
+
+Respond naturally in the same language as the user.
+Be helpful, accurate, clear and conversational.
+Do not invent facts or claim capabilities you do not have.
+Do not claim camera or screen access unless image frames
+have actually been supplied by the application.
 `;
 
 const VISION_SYSTEM_PROMPT = `
 You are Rairolaxy AI, the official AI assistant created by Rairolaxy.
 
-You are analyzing an image frame supplied by the Rairolaxy AI application.
-
-RULES:
-1. Your identity is always Rairolaxy AI.
-2. Never identify yourself as Gemini, NVIDIA or another provider.
-3. Analyze only the supplied image.
-4. Describe only things that are actually visible.
-5. Do not claim to see outside the supplied image.
-6. Do not claim continuous live video access.
-7. Answer the user's question directly.
-8. Respond in the user's language.
-9. If the image is unclear, explain that honestly.
+Analyze only the supplied image.
+Describe only what is actually visible.
+Do not claim to see outside the image.
+Do not claim continuous live video access.
+Answer directly in the user's language.
+If the image is unclear, explain that honestly.
 `;
 
 // ==========================================
@@ -96,12 +82,16 @@ function logError(provider, error) {
 }
 
 // ==========================================
-// HTTP JSON HELPER
+// JSON REQUEST HELPER
 // ==========================================
 
 async function fetchJson(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const timer = setTimeout(
+    () => controller.abort(),
+    timeoutMs
+  );
 
   try {
     const response = await fetch(url, {
@@ -109,13 +99,16 @@ async function fetchJson(url, options = {}, timeoutMs = 30000) {
       signal: controller.signal
     });
 
-    const text = await response.text();
-    let data;
+    const raw = await response.text();
+
+    let data = {};
 
     try {
-      data = text ? JSON.parse(text) : {};
+      data = raw ? JSON.parse(raw) : {};
     } catch {
-      throw new Error(`Invalid JSON response (HTTP ${response.status})`);
+      throw new Error(
+        `Invalid JSON response (HTTP ${response.status})`
+      );
     }
 
     if (!response.ok) {
@@ -129,12 +122,14 @@ async function fetchJson(url, options = {}, timeoutMs = 30000) {
     }
 
     return data;
+
   } catch (error) {
     if (error.name === "AbortError") {
       throw new Error(`Request timed out after ${timeoutMs}ms`);
     }
 
     throw error;
+
   } finally {
     clearTimeout(timer);
   }
@@ -175,7 +170,9 @@ function normalizeMessages(body = {}) {
   for (const item of history) {
     if (!item || typeof item !== "object") continue;
 
-    if (!["user", "assistant"].includes(item.role)) continue;
+    if (!["user", "assistant"].includes(item.role)) {
+      continue;
+    }
 
     const content = getText(item.content);
 
@@ -249,7 +246,9 @@ async function discoverGeminiModels() {
         !/embedding|aqa|image|audio|tts|veo|robotics/i.test(name)
       );
     })
-    .map(model => String(model.name).replace(/^models\//, ""));
+    .map(model =>
+      String(model.name).replace(/^models\//, "")
+    );
 }
 
 async function getGeminiCandidates() {
@@ -278,6 +277,7 @@ async function getGeminiCandidates() {
     });
 
     available.forEach(add);
+
   } catch (error) {
     logError("Gemini model discovery", error);
   }
@@ -286,7 +286,7 @@ async function getGeminiCandidates() {
 }
 
 // ==========================================
-// GEMINI TEXT CHAT
+// GEMINI CHAT
 // ==========================================
 
 async function askGemini(messages, model) {
@@ -345,19 +345,18 @@ async function askGemini(messages, model) {
     GEMINI_TIMEOUT
   );
 
-  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const parts =
+    data?.candidates?.[0]?.content?.parts || [];
 
   const answer = parts
-    .map(part => typeof part.text === "string" ? part.text : "")
+    .map(part =>
+      typeof part.text === "string" ? part.text : ""
+    )
     .join("")
     .trim();
 
   if (!answer) {
-    throw new Error(
-      data?.candidates?.[0]?.finishReason
-        ? `Gemini returned no text: ${data.candidates[0].finishReason}`
-        : "Gemini returned an empty answer."
-    );
+    throw new Error("Gemini returned an empty answer.");
   }
 
   return answer;
@@ -365,7 +364,7 @@ async function askGemini(messages, model) {
 
 // ==========================================
 // GEMINI VISION
-// CAMERA + SCREEN ANALYSIS
+// CAMERA + SCREEN
 // ==========================================
 
 async function askGeminiVision(image, prompt, model) {
@@ -437,10 +436,13 @@ async function askGeminiVision(image, prompt, model) {
     GEMINI_TIMEOUT
   );
 
-  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const parts =
+    data?.candidates?.[0]?.content?.parts || [];
 
   const answer = parts
-    .map(part => typeof part.text === "string" ? part.text : "")
+    .map(part =>
+      typeof part.text === "string" ? part.text : ""
+    )
     .join("")
     .trim();
 
@@ -460,14 +462,6 @@ async function askNvidia(messages) {
     throw new Error("NVIDIA_API_KEY is not configured.");
   }
 
-  const nvidiaMessages = [
-    {
-      role: "system",
-      content: SYSTEM_PROMPT
-    },
-    ...messages
-  ];
-
   const data = await fetchJson(
     NVIDIA_URL,
     {
@@ -478,7 +472,13 @@ async function askNvidia(messages) {
       },
       body: JSON.stringify({
         model: NVIDIA_MODEL,
-        messages: nvidiaMessages,
+        messages: [
+          {
+            role: "system",
+            content: SYSTEM_PROMPT
+          },
+          ...messages
+        ],
         temperature: 0.7,
         max_tokens: 2048,
         stream: false
@@ -499,6 +499,151 @@ async function askNvidia(messages) {
 }
 
 // ==========================================
+// INCEPTION PROVIDER
+// ==========================================
+
+let inceptionModelCache = {
+  expiresAt: 0,
+  chat: [],
+  fim: [],
+  edit: [],
+  errors: []
+};
+
+async function inceptionRequest(path, options = {}) {
+  if (!INCEPTION_API_KEY) {
+    const error = new Error(
+      "INCEPTION_API_KEY is not configured."
+    );
+    error.status = 503;
+    throw error;
+  }
+
+  const controller = new AbortController();
+
+  const timer = setTimeout(
+    () => controller.abort(),
+    120000
+  );
+
+  try {
+    const response = await fetch(
+      `${INCEPTION_BASE}${path}`,
+      {
+        ...options,
+        headers: {
+          Authorization: `Bearer ${INCEPTION_API_KEY}`,
+          "Content-Type": "application/json",
+          ...options.headers
+        },
+        signal: controller.signal
+      }
+    );
+
+    const raw = await response.text();
+
+    let data = {};
+
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      throw new Error(
+        `Inception returned invalid JSON (HTTP ${response.status}).`
+      );
+    }
+
+    if (!response.ok) {
+      const error = new Error(
+        data?.error?.message ||
+        data?.message ||
+        `Inception API returned HTTP ${response.status}`
+      );
+
+      error.status = response.status;
+      throw error;
+    }
+
+    return data;
+
+  } catch (error) {
+    if (error.name === "AbortError") {
+      const timeoutError = new Error(
+        "Inception request timed out."
+      );
+      timeoutError.status = 504;
+      throw timeoutError;
+    }
+
+    throw error;
+
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchInceptionModelList(path) {
+  const result = await inceptionRequest(path);
+
+  return Array.isArray(result.data)
+    ? result.data
+    : [];
+}
+
+async function getInceptionModels(forceRefresh = false) {
+  if (
+    !forceRefresh &&
+    Date.now() < inceptionModelCache.expiresAt
+  ) {
+    return inceptionModelCache;
+  }
+
+  const paths = [
+    "/chat/completions/models",
+    "/fim/completions/models",
+    "/edit/completions/models"
+  ];
+
+  const results = await Promise.allSettled(
+    paths.map(path => fetchInceptionModelList(path))
+  );
+
+  const errors = results
+    .filter(result => result.status === "rejected")
+    .map(result =>
+      result.reason?.message || "Model lookup failed."
+    );
+
+  const models = {
+    expiresAt: Date.now() + INCEPTION_CACHE_MS,
+    chat: results[0].status === "fulfilled"
+      ? results[0].value
+      : [],
+    fim: results[1].status === "fulfilled"
+      ? results[1].value
+      : [],
+    edit: results[2].status === "fulfilled"
+      ? results[2].value
+      : [],
+    errors
+  };
+
+  if (
+    !models.chat.length &&
+    !models.fim.length &&
+    !models.edit.length &&
+    errors.length
+  ) {
+    const error = new Error(errors.join("; "));
+    error.status = 502;
+    throw error;
+  }
+
+  inceptionModelCache = models;
+
+  return models;
+}
+
+// ==========================================
 // HEALTH CHECK
 // ==========================================
 
@@ -507,13 +652,18 @@ app.get("/health", (req, res) => {
     success: true,
     app: "Rairolaxy AI",
     status: "healthy",
-    aiConfigured: Boolean(GEMINI_API_KEY || NVIDIA_API_KEY),
+    aiConfigured: Boolean(
+      GEMINI_API_KEY ||
+      NVIDIA_API_KEY ||
+      INCEPTION_API_KEY
+    ),
     applicationIdentity: "Rairolaxy AI",
     primaryProvider: "Gemini",
     fallbackProvider: "NVIDIA",
     providers: {
       geminiConfigured: Boolean(GEMINI_API_KEY),
-      nvidiaConfigured: Boolean(NVIDIA_API_KEY)
+      nvidiaConfigured: Boolean(NVIDIA_API_KEY),
+      inceptionConfigured: Boolean(INCEPTION_API_KEY)
     },
     models: {
       gemini: GEMINI_MODEL,
@@ -523,7 +673,7 @@ app.get("/health", (req, res) => {
 });
 
 // ==========================================
-// PROVIDER STATUS
+// API STATUS
 // ==========================================
 
 app.get("/api/status", (req, res) => {
@@ -531,11 +681,16 @@ app.get("/api/status", (req, res) => {
     success: true,
     app: "Rairolaxy AI",
     applicationIdentity: "Rairolaxy AI",
-    aiConfigured: Boolean(GEMINI_API_KEY || NVIDIA_API_KEY),
+    aiConfigured: Boolean(
+      GEMINI_API_KEY ||
+      NVIDIA_API_KEY ||
+      INCEPTION_API_KEY
+    ),
     primaryProvider: "Gemini",
     fallbackProvider: "NVIDIA",
     modelDiscoveryEnabled: true,
     visionConfigured: Boolean(GEMINI_API_KEY),
+
     providers: {
       gemini: {
         configured: Boolean(GEMINI_API_KEY),
@@ -544,6 +699,10 @@ app.get("/api/status", (req, res) => {
       nvidia: {
         configured: Boolean(NVIDIA_API_KEY),
         model: NVIDIA_MODEL
+      },
+      inception: {
+        configured: Boolean(INCEPTION_API_KEY),
+        baseUrl: INCEPTION_BASE
       }
     }
   });
@@ -558,10 +717,14 @@ app.get("/api/capabilities", (req, res) => {
     success: true,
     app: "Rairolaxy AI",
     identity: "Rairolaxy AI",
+
     chat: {
-      enabled: Boolean(GEMINI_API_KEY || NVIDIA_API_KEY),
+      enabled: Boolean(
+        GEMINI_API_KEY || NVIDIA_API_KEY
+      ),
       endpoint: "/api/chat"
     },
+
     vision: {
       enabled: Boolean(GEMINI_API_KEY),
       cameraFrameAnalysis: Boolean(GEMINI_API_KEY),
@@ -574,9 +737,20 @@ app.get("/api/capabilities", (req, res) => {
       ],
       continuousLiveStream: false
     },
+
     providers: {
       geminiConfigured: Boolean(GEMINI_API_KEY),
-      nvidiaConfigured: Boolean(NVIDIA_API_KEY)
+      nvidiaConfigured: Boolean(NVIDIA_API_KEY),
+      inceptionConfigured: Boolean(INCEPTION_API_KEY)
+    },
+
+    inception: {
+      enabled: Boolean(INCEPTION_API_KEY),
+      statusEndpoint: "/api/providers/inception/status",
+      modelsEndpoint: "/api/providers/inception/models",
+      chatEndpoint: "/api/providers/inception/chat",
+      fimEndpoint: "/api/providers/inception/fim",
+      editEndpoint: "/api/providers/inception/edit"
     }
   });
 });
@@ -605,9 +779,14 @@ app.post("/api/chat", async (req, res) => {
 
     for (const model of candidates) {
       try {
-        console.log(`Rairolaxy AI using Gemini model: ${model}`);
+        console.log(
+          `Rairolaxy AI using Gemini model: ${model}`
+        );
 
-        const answer = await askGemini(messages, model);
+        const answer = await askGemini(
+          messages,
+          model
+        );
 
         return res.json({
           success: true,
@@ -620,6 +799,7 @@ app.post("/api/chat", async (req, res) => {
           model,
           fallbackUsed: model !== GEMINI_MODEL
         });
+
       } catch (error) {
         logError(`Gemini ${model}`, error);
 
@@ -637,6 +817,7 @@ app.post("/api/chat", async (req, res) => {
         error: "No available Gemini models were discovered."
       });
     }
+
   } else {
     failures.push({
       provider: "Gemini",
@@ -646,7 +827,9 @@ app.post("/api/chat", async (req, res) => {
 
   if (NVIDIA_API_KEY) {
     try {
-      console.log("Switching Rairolaxy AI chat to NVIDIA fallback.");
+      console.log(
+        "Switching Rairolaxy AI chat to NVIDIA fallback."
+      );
 
       const answer = await askNvidia(messages);
 
@@ -661,6 +844,7 @@ app.post("/api/chat", async (req, res) => {
         model: NVIDIA_MODEL,
         fallbackUsed: true
       });
+
     } catch (error) {
       logError("NVIDIA fallback", error);
 
@@ -669,6 +853,7 @@ app.post("/api/chat", async (req, res) => {
         error: error.message
       });
     }
+
   } else {
     failures.push({
       provider: "NVIDIA",
@@ -685,9 +870,8 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // ==========================================
-// CAMERA / SCREEN IMAGE ANALYSIS API
+// CAMERA / SCREEN VISION API
 // POST /api/vision
-// Body: { source, image, prompt }
 // ==========================================
 
 app.post("/api/vision", async (req, res) => {
@@ -715,120 +899,4 @@ app.post("/api/vision", async (req, res) => {
     });
   }
 
-  if (typeof image !== "string" || !image) {
-    return res.status(400).json({
-      success: false,
-      error: "Provide an image data URL in the image field."
-    });
-  }
-
-  if (image.length > MAX_IMAGE_CHARS) {
-    return res.status(413).json({
-      success: false,
-      error: "Image is too large. Reduce resolution or quality."
-    });
-  }
-
-  if (prompt.length > 4000) {
-    return res.status(400).json({
-      success: false,
-      error: "Vision prompt is too long."
-    });
-  }
-
-  const candidates = await getGeminiCandidates();
-  const failures = [];
-
-  for (const model of candidates) {
-    try {
-      console.log(
-        `Rairolaxy AI vision (${source}) using ${model}`
-      );
-
-      const answer = await askGeminiVision(
-        image,
-        prompt,
-        model
-      );
-
-      return res.json({
-        success: true,
-        app: "Rairolaxy AI",
-        identity: "Rairolaxy AI",
-        answer,
-        reply: answer,
-        response: answer,
-        provider: "Gemini",
-        model,
-        source
-      });
-    } catch (error) {
-      logError(`Vision ${model}`, error);
-
-      failures.push({
-        model,
-        error: error.message
-      });
-    }
-  }
-
-  return res.status(502).json({
-    success: false,
-    app: "Rairolaxy AI",
-    error: "Image analysis failed for all available Gemini models.",
-    details: failures
-  });
-});
-
-// ==========================================
-// UNKNOWN API ROUTES
-// ==========================================
-
-app.use("/api", (req, res) => {
-  res.status(404).json({
-    success: false,
-    error: "API endpoint not found."
-  });
-});
-
-// ==========================================
-// INVALID JSON HANDLER
-// ==========================================
-
-app.use((error, req, res, next) => {
-  if (error instanceof SyntaxError && "body" in error) {
-    return res.status(400).json({
-      success: false,
-      error: "Invalid JSON request body."
-    });
-  }
-
-  if (error?.type === "entity.too.large") {
-    return res.status(413).json({
-      success: false,
-      error: "Request body is too large."
-    });
-  }
-
-  console.error("Unhandled backend error:", error.message);
-
-  return res.status(500).json({
-    success: false,
-    error: "Internal server error."
-  });
-});
-
-// ==========================================
-// START SERVER
-// ==========================================
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Rairolaxy AI backend running on port ${PORT}`);
-  console.log(`Gemini configured: ${Boolean(GEMINI_API_KEY)}`);
-  console.log(`NVIDIA configured: ${Boolean(NVIDIA_API_KEY)}`);
-  console.log(`Vision configured: ${Boolean(GEMINI_API_KEY)}`);
-  console.log(`Application identity: Rairolaxy AI`);
-  console.log(`Gemini model: ${GEMINI_MODEL}`);
-  console.log(`NVIDIA fallback model: ${NVIDIA_MODEL}`);
-});
-        
+  if (typeof ima
