@@ -829,155 +829,153 @@ error: "Could not load messages."
 }
 });
 // ==========================================
-‎// DATABASE: SAVE MESSAGE
-‎// POST /api/conversations/:id/messages
-‎// body: { "userId": "...", "role": "user", "content": "..." }
-‎// ==========================================
-‎
-‎app.post("/api/conversations/:id/messages", async (req, res) => {
-‎if (!databaseReady) {
-‎return res.status(503).json({
-‎success: false,
-‎error: "Database is not ready."
-‎});
-‎}
-‎
-‎const conversationId = req.params.id;
-‎const userId = String(req.body?.userId || "").trim();
-‎const role = req.body?.role;
-‎const content = String(req.body?.content || "").trim();
-‎const provider = req.body?.provider || null;
-‎
-‎if (!userId || !["user", "assistant"].includes(role) || !content) {
-‎return res.status(400).json({
-‎success: false,
-‎error: "userId, valid role and content are required."
-‎});
-‎}
-‎
-‎if (content.length > 20000) {
-‎return res.status(400).json({
-‎success: false,
-‎error: "Message is too long."
-‎});
-‎}
-‎
-‎try {
-‎const check = await pool.query(
-‎`SELECT id FROM conversations
-‎WHERE id = $1 AND user_id = $2`,
-‎[conversationId, userId]
-‎);
-‎
-‎if (!check.rows.length) {
-‎return res.status(404).json({
-‎success: false,
-‎error: "Conversation not found."
-‎});
-‎}
-‎
-‎const result = await pool.query(
-‎`INSERT INTO messages (conversation_id, role, content, provider)
-‎VALUES ($1, $2, $3, $4)
-‎RETURNING *`,
-‎[conversationId, role, content, provider]
-‎);
-‎
-‎await pool.query(
-‎`UPDATE conversations
-‎SET updated_at = NOW()
-‎WHERE id = $1`,
-‎[conversationId]
-‎);
-‎
-‎return res.json({
-‎success: true,
-‎message: result.rows[0]
-‎});
-‎} catch (error) {
-‎console.error("Save message error:", safeError(error));
-‎return res.status(500).json({
-‎success: false,
-‎error: "Could not save message."
-‎});
-‎}
-‎});
-‎
-‎// ==========================================
-‎// DATABASE: GET CONVERSATION MESSAGES
-‎// GET /api/conversations/:id/messages?userId=...
-‎// ==========================================
-‎
-‎app.get("/api/conversations/:id/messages", async (req, res) => {
-‎if (!databaseReady) {
-‎return res.status(503).json({
-‎success: false,
-‎error: "Database is not ready."
-‎});
-‎}
-‎
-‎const userId = String(req.query.userId || "").trim();
-‎
-‎if (!userId) {
-‎return res.status(400).json({
-‎success: false,
-‎error: "userId is required."
-‎});
-‎}
-‎
-‎try {
-‎const check = await pool.query(
-‎`SELECT id FROM conversations
-‎WHERE id = $1 AND user_id = $2`,
-‎[req.params.id, userId]
-‎);
-‎
-‎if (!check.rows.length) {
-‎return res.status(404).json({
-‎success: false,
-‎error: "Conversation not found."
-‎});
-‎}
-‎
-‎const result = await pool.query(
-‎`SELECT * FROM messages
-‎WHERE conversation_id = $1
-‎ORDER BY created_at ASC`,
-‎[req.params.id]
-‎);
-‎
-‎return res.json({
-‎success: true,
-‎messages: result.rows
-‎});
-‎} catch (error) {
-‎console.error("Load messages error:", safeError(error));
-‎return res.status(500).json({
-‎success: false,
-‎error: "Could not load messages."
-‎});
-‎}
-‎});
-‎
-‎// ==========================================
-‎// SERVER START
-‎// ==========================================
-‎
-‎async function startServer() {
-‎await initializeDatabase();
-‎
-‎app.listen(PORT, "0.0.0.0", () => {
-‎console.log(`Rairolaxy AI backend running on port ${PORT}`);
-‎console.log("Primary AI: Gemini");
-‎console.log("Fallback AI: NVIDIA");
-‎console.log("Vision API: /api/vision");
-‎console.log("Inception API: enabled when API key is configured");
-‎});
-‎}
-‎
-‎startServer().catch(error => {
-‎console.error("Server startup error:", safeError(error));
-‎process.exit(1);
-‎});
-‎
-‎
+// DATABASE: SAVE MESSAGE
+// POST /api/conversations/:id/messages
+// body: { "userId": "...", "role": "user", "content": "..." }
+// ==========================================
+
+app.post("/api/conversations/:id/messages", async (req, res) => {
+  if (!databaseReady) {
+    return res.status(503).json({
+      success: false,
+      error: "Database is not ready."
+    });
+  }
+
+  const conversationId = req.params.id;
+  const userId = String(req.body?.userId || "").trim();
+  const role = req.body?.role;
+  const content = String(req.body?.content || "").trim();
+  const provider = req.body?.provider || null;
+
+  if (!userId || !["user", "assistant"].includes(role) || !content) {
+    return res.status(400).json({
+      success: false,
+      error: "userId, valid role and content are required."
+    });
+  }
+
+  if (content.length > 20000) {
+    return res.status(400).json({
+      success: false,
+      error: "Message is too long."
+    });
+  }
+
+  try {
+    const check = await pool.query(
+      `SELECT id FROM conversations
+       WHERE id = $1 AND user_id = $2`,
+      [conversationId, userId]
+    );
+
+    if (!check.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "Conversation not found."
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO messages (conversation_id, role, content, provider)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [conversationId, role, content, provider]
+    );
+
+    await pool.query(
+      `UPDATE conversations
+       SET updated_at = NOW()
+       WHERE id = $1`,
+      [conversationId]
+    );
+
+    return res.json({
+      success: true,
+      message: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Save message error:", safeError(error));
+    return res.status(500).json({
+      success: false,
+      error: "Could not save message."
+    });
+  }
+});
+
+// ==========================================
+// DATABASE: GET CONVERSATION MESSAGES
+// GET /api/conversations/:id/messages?userId=...
+// ==========================================
+
+app.get("/api/conversations/:id/messages", async (req, res) => {
+  if (!databaseReady) {
+    return res.status(503).json({
+      success: false,
+      error: "Database is not ready."
+    });
+  }
+
+  const userId = String(req.query.userId || "").trim();
+
+  if (!userId) {
+    return res.status(400).json({
+      success: false,
+      error: "userId is required."
+    });
+  }
+
+  try {
+    const check = await pool.query(
+      `SELECT id FROM conversations
+       WHERE id = $1 AND user_id = $2`,
+      [req.params.id, userId]
+    );
+
+    if (!check.rows.length) {
+      return res.status(404).json({
+        success: false,
+        error: "Conversation not found."
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT * FROM messages
+       WHERE conversation_id = $1
+       ORDER BY created_at ASC`,
+      [req.params.id]
+    );
+
+    return res.json({
+      success: true,
+      messages: result.rows
+    });
+  } catch (error) {
+    console.error("Load messages error:", safeError(error));
+    return res.status(500).json({
+      success: false,
+      error: "Could not load messages."
+    });
+  }
+});
+
+// ==========================================
+// SERVER START
+// ==========================================
+
+async function startServer() {
+  await initializeDatabase();
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Rairolaxy AI backend running on port ${PORT}`);
+    console.log("Primary AI: Gemini");
+    console.log("Fallback AI: NVIDIA");
+    console.log("Vision API: /api/vision");
+    console.log("Inception API: enabled when API key is configured");
+  });
+}
+
+startServer().catch(error => {
+  console.error("Server startup error:", safeError(error));
+  process.exit(1);
+});
